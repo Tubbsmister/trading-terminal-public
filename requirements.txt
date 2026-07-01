@@ -1,0 +1,22 @@
+# Prediction Market Trading Terminal — Dependencies
+# Install with: pip install -r requirements.txt
+
+requests>=2.28.0
+numpy>=1.23.0           # calibration, model, Markov engine
+
+# Options wheel (Fidelity cash-secured-put autotrader — propose-only)
+yfinance>=0.2           # free equity option chains + quotes + earnings dates
+anthropic>=0.40         # news-sentiment gate (claude-opus-4-8); optional — keyword fallback if no key
+
+# Polymarket trading layer — CLOB / Exchange V2 (April 2026 migration)
+py-clob-client-v2>=1.0.1      # signs + posts orders to Polymarket CLOB V2 (pUSD)
+py-builder-relayer-client>=0.0.2  # deposit-wallet deploy/approve via the relayer
+py-builder-signing-sdk        # builder-cred signing (dep of the relayer client)
+web3>=6.0               # on-chain wrap (USDC.e->pUSD) + transfers
+eth-account>=0.10       # wallet generation + signing
+python-dotenv>=1.0      # loads .env (private key, API creds)
+
+# Optional (legacy V1 client + dashboards; not needed by the daemon)
+# py-clob-client>=0.20
+# flask>=2.0.0
+# flask-cors>=4.0.0

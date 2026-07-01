@@ -1,0 +1,48 @@
+# ─── SECRETS — never commit (real-money wallet key + API creds) ───
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*wallet*keys*.txt
+secrets.*
+
+# ─── Machine-specific runtime state (each machine keeps its own) ───
+trade_ledger.csv
+poly_daemon_state.json
+STOP
+*.log
+
+# ─── Generated / regenerable data (daemon rebuilds the curve on demand) ───
+longshot_samples.json
+longshot_model.json
+# longshot_curve.json is committed so a fresh clone works immediately.
+
+# ─── Options wheel — personal trade state (each machine keeps its own) ───
+wheel_positions.json    # your real open cash-secured puts
+wheel_journal.csv       # proposal/fill/close audit log
+csp_candidates.json     # scanner scratch output
+
+# ─── Pipeline (Phase 0+) — local market DB + runtime state ───
+pipeline.db
+pipeline.db-wal
+pipeline.db-shm
+pipeline/data/
+
+# ─── Python ───
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ─── Misc ───
+*.zip
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Self-improvement loop benchmark snapshots
+benchmarks/
