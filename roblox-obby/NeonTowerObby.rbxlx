@@ -1,0 +1,1413 @@
+<roblox version="4">
+  <Item class="Lighting" referent="0">
+    <Properties>
+      <string name="Name">Lighting</string>
+      <Color3 name="Ambient">
+        <R>0.35</R>
+        <G>0.3</G>
+        <B>0.5</B>
+      </Color3>
+      <float name="Brightness">2</float>
+      <float name="ClockTime">0</float>
+      <Color3 name="OutdoorAmbient">
+        <R>0.4</R>
+        <G>0.35</G>
+        <B>0.6</B>
+      </Color3>
+    </Properties>
+  </Item>
+  <Item class="ReplicatedStorage" referent="1">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="2">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+-- Central tuning + monetization IDs.
+-- After publishing once, create the passes/products in Creator Hub
+-- (Monetization > Passes / Developer Products) and paste their IDs here.
+-- Any ID left at 0 is hidden from the shop, so the game runs fine without them.
+
+local Config = {}
+
+Config.GameName = "Neon Tower Obby"
+Config.StageCount = 60
+Config.Seed = 20261007 -- change to regenerate a different course layout
+
+Config.GamePasses = {
+	VIP = {
+		Id = 0,
+		Name = "VIP",
+		Description = "Gold VIP tag, rainbow trail and +25% run speed forever.",
+	},
+	SpeedCoil = {
+		Id = 0,
+		Name = "Speed Coil",
+		Description = "Equip to run 75% faster.",
+	},
+	GravityCoil = {
+		Id = 0,
+		Name = "Gravity Coil",
+		Description = "Equip for super-high, floaty jumps.",
+	},
+}
+
+-- Display order in the shop
+Config.GamePassOrder = { "VIP", "SpeedCoil", "GravityCoil" }
+
+Config.Products = {
+	SkipStage = {
+		Id = 0,
+		Name = "Skip Stage",
+		Stages = 1,
+	},
+	Skip5Stages = {
+		Id = 0,
+		Name = "Skip 5 Stages",
+		Stages = 5,
+	},
+}
+
+Config.ProductOrder = { "SkipStage", "Skip5Stages" }
+
+-- Gameplay
+Config.BaseWalkSpeed = 16
+Config.VipWalkSpeed = 20
+Config.SpeedCoilWalkSpeed = 28
+Config.GravityCoilLift = 0.7 -- fraction of gravity cancelled while equipped
+Config.DeathsBeforeSkipNudge = 3 -- deaths on one stage before suggesting a skip
+
+return Config
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="4">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="5">
+      <Properties>
+        <string name="Name">Server</string>
+      </Properties>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">Data</string>
+          <string name="Source"><![CDATA[--!strict
+-- Player save data (stage, wins, processed receipt IDs) in one DataStore key.
+-- Receipt IDs live in the same record so purchase grants are idempotent.
+
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+
+local Data = {}
+
+export type Profile = {
+	Stage: number,
+	Wins: number,
+	Receipts: { string },
+}
+
+local MAX_RECEIPTS = 100
+
+local store: DataStore? = nil
+local ok = pcall(function()
+	store = DataStoreService:GetDataStore("NeonObby_v1")
+end)
+-- In Studio without "Enable Studio Access to API Services" this fails; the
+-- game still runs, it just doesn't save.
+Data.Enabled = ok and store ~= nil
+
+local function default(): Profile
+	return { Stage = 1, Wins = 0, Receipts = {} }
+end
+
+local function retry<T>(fn: () -> T): (boolean, T?)
+	for attempt = 1, 3 do
+		local success, result = pcall(fn)
+		if success then
+			return true, result
+		end
+		warn(`DataStore attempt {attempt} failed: {result}`)
+		task.wait(attempt)
+	end
+	return false, nil
+end
+
+function Data.load(userId: number): Profile
+	if not Data.Enabled or not store then
+		return default()
+	end
+	local s = store :: DataStore
+	local success, raw = retry(function()
+		return s:GetAsync(tostring(userId))
+	end)
+	if not success then
+		if RunService:IsStudio() then
+			Data.Enabled = false
+		end
+		return default()
+	end
+	local profile = default()
+	if type(raw) == "table" then
+		profile.Stage = tonumber(raw.Stage) or 1
+		profile.Wins = tonumber(raw.Wins) or 0
+		if type(raw.Receipts) == "table" then
+			profile.Receipts = raw.Receipts
+		end
+	end
+	return profile
+end
+
+function Data.save(userId: number, profile: Profile): boolean
+	if not Data.Enabled or not store then
+		return false
+	end
+	local s = store :: DataStore
+	while #profile.Receipts > MAX_RECEIPTS do
+		table.remove(profile.Receipts, 1)
+	end
+	local success = retry(function()
+		return s:UpdateAsync(tostring(userId), function(old)
+			-- Keep the higher stage/wins in case another server wrote last.
+			local merged = {
+				Stage = profile.Stage,
+				Wins = profile.Wins,
+				Receipts = profile.Receipts,
+			}
+			if type(old) == "table" and (tonumber(old.Wins) or 0) > profile.Wins then
+				merged.Wins = old.Wins
+			end
+			return merged
+		end)
+	end)
+	return success
+end
+
+function Data.hasReceipt(profile: Profile, purchaseId: string): boolean
+	return table.find(profile.Receipts, purchaseId) ~= nil
+end
+
+return Data
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Script" referent="7">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+-- Server entry: builds the course, tracks stages, saves progress, and handles
+-- game passes and developer products.
+
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage.Shared.Config)
+local Obby = require(script.Parent.Obby)
+local Data = require(script.Parent.Data)
+local Perks = require(script.Parent.Perks)
+
+Players.CharacterAutoLoads = false
+Players.RespawnTime = 1.5
+
+local remotes = Instance.new("Folder")
+remotes.Name = "Remotes"
+local function remote(name: string): RemoteEvent
+	local r = Instance.new("RemoteEvent")
+	r.Name = name
+	r.Parent = remotes
+	return r
+end
+local Notify = remote("Notify") -- (text: string, kind: string)
+local SkipNudge = remote("SkipNudge") -- (stage: number)
+local Restart = remote("Restart")
+remotes.Parent = ReplicatedStorage
+
+local course = Obby.build()
+
+type Session = {
+	profile: Data.Profile,
+	stageValue: IntValue,
+	winsValue: IntValue,
+	deathsOnStage: number,
+	dirty: boolean,
+}
+local sessions: { [Player]: Session } = {}
+
+local function checkpointCFrame(stage: number): CFrame
+	local pad = course.Checkpoints[math.clamp(stage, 1, #course.Checkpoints)]
+	return pad.CFrame * CFrame.new(0, 4, 0)
+end
+
+local function teleportToCheckpoint(player: Player)
+	local s = sessions[player]
+	local char = player.Character
+	if s and char and char.PrimaryPart then
+		char:PivotTo(checkpointCFrame(s.profile.Stage))
+	end
+end
+
+local function setStage(player: Player, stage: number)
+	local s = sessions[player]
+	if not s then
+		return
+	end
+	stage = math.clamp(stage, 1, Config.StageCount)
+	if stage == s.profile.Stage then
+		return
+	end
+	s.profile.Stage = stage
+	s.stageValue.Value = stage
+	s.deathsOnStage = 0
+	s.dirty = true
+	player:SetAttribute("Stage", stage)
+end
+
+local function spawn(player: Player)
+	if not player.Parent or not sessions[player] then
+		return
+	end
+	if pcall(player.LoadCharacter, player) then
+		teleportToCheckpoint(player)
+	end
+end
+
+local function onCharacter(player: Player, char: Model)
+	local hum = char:WaitForChild("Humanoid") :: Humanoid
+	Perks.applyToCharacter(player, char)
+	hum.Died:Connect(function()
+		local s = sessions[player]
+		if s then
+			s.deathsOnStage += 1
+			if s.deathsOnStage == Config.DeathsBeforeSkipNudge and s.profile.Stage < Config.StageCount then
+				SkipNudge:FireClient(player, s.profile.Stage)
+			end
+		end
+		task.wait(Players.RespawnTime)
+		if player.Character == char then
+			spawn(player)
+		end
+	end)
+end
+
+local function onPlayerAdded(player: Player)
+	local profile = Data.load(player.UserId)
+	if not player.Parent then
+		return
+	end
+
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	local stageValue = Instance.new("IntValue")
+	stageValue.Name = "Stage"
+	stageValue.Value = profile.Stage
+	stageValue.Parent = leaderstats
+	local winsValue = Instance.new("IntValue")
+	winsValue.Name = "Wins"
+	winsValue.Value = profile.Wins
+	winsValue.Parent = leaderstats
+	leaderstats.Parent = player
+
+	sessions[player] = {
+		profile = profile,
+		stageValue = stageValue,
+		winsValue = winsValue,
+		deathsOnStage = 0,
+		dirty = false,
+	}
+	player:SetAttribute("Stage", profile.Stage)
+	player:SetAttribute("StageCount", Config.StageCount)
+
+	Perks.loadOwnership(player)
+	player.CharacterAdded:Connect(function(char)
+		onCharacter(player, char)
+	end)
+	spawn(player)
+end
+
+local function saveSession(player: Player)
+	local s = sessions[player]
+	if s then
+		Data.save(player.UserId, s.profile)
+		s.dirty = false
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, p in Players:GetPlayers() do
+	task.spawn(onPlayerAdded, p)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	saveSession(player)
+	sessions[player] = nil
+end)
+
+game:BindToClose(function()
+	for player in sessions do
+		task.spawn(saveSession, player)
+	end
+	task.wait(3)
+end)
+
+-- Autosave dirty sessions every minute.
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for player, s in sessions do
+			if s.dirty then
+				task.spawn(saveSession, player)
+			end
+		end
+	end
+end)
+
+-- Checkpoints only ever move a player forward.
+for index, pad in course.Checkpoints do
+	pad.Touched:Connect(function(hit)
+		local player = Players:GetPlayerFromCharacter(hit.Parent)
+		local s = player and sessions[player]
+		if player and s and index > s.profile.Stage then
+			local hum = (hit.Parent :: Instance):FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then
+				setStage(player, index)
+				Notify:FireClient(player, `Checkpoint! Stage {index}`, "stage")
+			end
+		end
+	end)
+end
+
+local finishDebounce: { [Player]: boolean } = {}
+course.Finish.Touched:Connect(function(hit)
+	local player = Players:GetPlayerFromCharacter(hit.Parent)
+	local s = player and sessions[player]
+	if not (player and s) or finishDebounce[player] or s.profile.Stage < Config.StageCount then
+		return
+	end
+	finishDebounce[player] = true
+	s.profile.Wins += 1
+	s.winsValue.Value = s.profile.Wins
+	s.dirty = true
+	player:SetAttribute("Completed", true)
+	Notify:FireClient(player, `YOU BEAT {string.upper(Config.GameName)}! Wins: {s.profile.Wins}`, "win")
+	saveSession(player)
+	task.wait(3)
+	finishDebounce[player] = nil
+end)
+
+Restart.OnServerEvent:Connect(function(player)
+	local s = sessions[player]
+	if s and player:GetAttribute("Completed") then
+		player:SetAttribute("Completed", nil)
+		setStage(player, 1)
+		teleportToCheckpoint(player)
+	end
+end)
+
+-- Fall detection: drop far below your checkpoint and you respawn there.
+-- Stops falls from a high lap landing you on an earlier stage.
+task.spawn(function()
+	while true do
+		task.wait(0.25)
+		for player, s in sessions do
+			local char = player.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 and not player:GetAttribute("Completed") then
+				local floorY = checkpointCFrame(s.profile.Stage).Position.Y - 30
+				if root.Position.Y < floorY then
+					hum.Health = 0
+				end
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------------------
+-- Monetization
+----------------------------------------------------------------------------
+
+local productById: { [number]: { Stages: number, Name: string } } = {}
+for _, key in Config.ProductOrder do
+	local p = Config.Products[key]
+	if p.Id ~= 0 then
+		productById[p.Id] = p
+	end
+end
+
+MarketplaceService.ProcessReceipt = function(receipt)
+	local player = Players:GetPlayerByUserId(receipt.PlayerId)
+	local s = player and sessions[player]
+	if not (player and s) then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+	local purchaseId = tostring(receipt.PurchaseId)
+	if Data.hasReceipt(s.profile, purchaseId) then
+		return Enum.ProductPurchaseDecision.PurchaseGranted
+	end
+	local product = productById[receipt.ProductId]
+	if not product then
+		warn(`Unknown developer product {receipt.ProductId}`)
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	table.insert(s.profile.Receipts, purchaseId)
+	setStage(player, s.profile.Stage + product.Stages)
+	teleportToCheckpoint(player)
+	Notify:FireClient(player, `Skipped to Stage {s.profile.Stage}!`, "purchase")
+
+	local saved = Data.save(player.UserId, s.profile)
+	if saved or not Data.Enabled then
+		s.dirty = false
+		return Enum.ProductPurchaseDecision.PurchaseGranted
+	end
+	-- Roblox will retry; the receipt ID in memory stops a double grant.
+	return Enum.ProductPurchaseDecision.NotProcessedYet
+end
+
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, passId, purchased)
+	if purchased then
+		local key = Perks.grantPassById(player, passId)
+		if key then
+			Notify:FireClient(player, `Thanks! {Config.GamePasses[key].Name} unlocked.`, "purchase")
+		end
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">Obby</string>
+          <string name="Source"><![CDATA[--!strict
+-- Procedurally builds the whole course at server start, so the place file
+-- needs no hand-built parts. Stages spiral upward into a tower: each stage is
+-- built in its own local frame along +Z, then the frame turns 90 degrees.
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local Config = require(game:GetService("ReplicatedStorage").Shared.Config)
+
+local Obby = {}
+
+local PAD_SIZE = 12
+local MIN_STAGE_RISE = 10
+
+export type Course = {
+	Checkpoints: { BasePart },
+	Finish: BasePart,
+}
+
+type Ctx = {
+	frame: CFrame,
+	model: Model,
+	color: Color3,
+	rng: Random,
+}
+
+local function lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+local function makePart(ctx: Ctx, size: Vector3, localCFrame: CFrame, props: { [string]: any }?): Part
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.Size = size
+	p.CFrame = ctx.frame * localCFrame
+	p.Color = ctx.color
+	p.Material = Enum.Material.SmoothPlastic
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	if props then
+		for k, v in props do
+			(p :: any)[k] = v
+		end
+	end
+	p.Parent = ctx.model
+	return p
+end
+
+-- Platform whose top surface is at y and whose back edge is at z.
+local function platform(ctx: Ctx, size: Vector3, x: number, y: number, z: number, props: { [string]: any }?): Part
+	return makePart(ctx, size, CFrame.new(x, y - size.Y / 2, z + size.Z / 2), props)
+end
+
+local function humanoidFromHit(hit: BasePart): Humanoid?
+	local model = hit:FindFirstAncestorOfClass("Model")
+	if model and Players:GetPlayerFromCharacter(model) then
+		return model:FindFirstChildOfClass("Humanoid")
+	end
+	return nil
+end
+
+local function makeKill(part: BasePart)
+	part.Color = Color3.fromRGB(255, 40, 60)
+	part.Material = Enum.Material.Neon
+	part:SetAttribute("Kill", true)
+	part.Touched:Connect(function(hit)
+		local hum = humanoidFromHit(hit)
+		if hum and hum.Health > 0 then
+			hum.Health = 0
+		end
+	end)
+end
+
+local function label(part: BasePart, text: string, color: Color3, maxDistance: number)
+	local gui = Instance.new("BillboardGui")
+	gui.Size = UDim2.fromOffset(220, 60)
+	gui.StudsOffset = Vector3.new(0, 5, 0)
+	gui.AlwaysOnTop = false
+	gui.MaxDistance = maxDistance
+	gui.Parent = part
+	local t = Instance.new("TextLabel")
+	t.Size = UDim2.fromScale(1, 1)
+	t.BackgroundTransparency = 1
+	t.Font = Enum.Font.FredokaOne
+	t.TextScaled = true
+	t.TextColor3 = color
+	t.TextStrokeTransparency = 0.2
+	t.Text = text
+	t.Parent = gui
+end
+
+-- Spinning kill bars, driven from one loop. Overlap queries make the kill
+-- reliable even though the bars are anchored and moved by CFrame.
+local spinners: { { bar: BasePart, pivot: CFrame, speed: number } } = {}
+
+local function startSpinnerLoop(course: Model)
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { course }
+	RunService.Heartbeat:Connect(function()
+		local t = os.clock()
+		for _, s in spinners do
+			s.bar.CFrame = s.pivot * CFrame.Angles(0, t * s.speed, 0)
+			for _, hit in workspace:GetPartsInPart(s.bar, params) do
+				local hum = humanoidFromHit(hit)
+				if hum and hum.Health > 0 then
+					hum.Health = 0
+				end
+			end
+		end
+	end)
+end
+
+-- Obstacle builders. Each takes a cursor (x, top y, front-edge z in the
+-- stage's local frame) and returns the cursor after its last piece.
+type Builder = (ctx: Ctx, cur: Vector3, diff: number) -> Vector3
+
+local function jumps(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local rng = ctx.rng
+	local x, y, z = cur.X, cur.Y, cur.Z
+	local size = lerp(6, 3.5, diff)
+	for _ = 1, rng:NextInteger(4, 6) do
+		local gap = lerp(3.5, 7, diff) + rng:NextNumber(-0.5, 0.5)
+		y += rng:NextNumber(-1, 2) * (1 - 0.4 * diff)
+		x = math.clamp(x + rng:NextNumber(-3, 3), -8, 8)
+		z += gap
+		platform(ctx, Vector3.new(size, 1, size), x, y, z)
+		z += size
+	end
+	return Vector3.new(x, y, z)
+end
+
+local function killBars(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local length = math.floor(lerp(30, 44, diff))
+	local z0 = cur.Z + 3
+	platform(ctx, Vector3.new(7, 1, length), cur.X, cur.Y, z0)
+	local barHeight = lerp(1, 2.2, diff)
+	local zb = z0 + 8
+	while zb < z0 + length - 5 do
+		local bar = platform(ctx, Vector3.new(7, barHeight, 1.5), cur.X, cur.Y + barHeight, zb)
+		makeKill(bar)
+		zb += lerp(10, 7.5, diff)
+	end
+	return Vector3.new(cur.X, cur.Y, z0 + length)
+end
+
+local function spinner(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local d = 26
+	local center = CFrame.new(cur.X, cur.Y, cur.Z + 3 + d / 2)
+	makePart(ctx, Vector3.new(1, d, d), center * CFrame.new(0, -0.5, 0) * CFrame.Angles(0, 0, math.rad(90)), {
+		Shape = Enum.PartType.Cylinder,
+	})
+	local bar = makePart(ctx, Vector3.new(d - 2, 1, 1), center * CFrame.new(0, 1, 0))
+	makeKill(bar)
+	local hub = makePart(ctx, Vector3.new(1.2, 2, 2), center * CFrame.new(0, 1, 0) * CFrame.Angles(0, 0, math.rad(90)), {
+		Shape = Enum.PartType.Cylinder,
+		Color = Color3.fromRGB(30, 30, 40),
+	})
+	hub.CanCollide = false
+	table.insert(spinners, {
+		bar = bar,
+		pivot = ctx.frame * center * CFrame.new(0, 1, 0),
+		speed = lerp(1.4, 3, diff) * (ctx.rng:NextNumber() < 0.5 and -1 or 1),
+	})
+	return Vector3.new(cur.X, cur.Y, cur.Z + 3 + d)
+end
+
+local function vanishing(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local rng = ctx.rng
+	local x, y, z = cur.X, cur.Y, cur.Z
+	local delay = lerp(0.9, 0.45, diff)
+	for _ = 1, rng:NextInteger(5, 7) do
+		z += lerp(2.5, 4.5, diff)
+		x = math.clamp(x + rng:NextNumber(-2, 2), -8, 8)
+		local tile = platform(ctx, Vector3.new(5, 1, 5), x, y, z, {
+			Material = Enum.Material.Neon,
+			Transparency = 0.15,
+		})
+		local busy = false
+		tile.Touched:Connect(function(hit)
+			if busy or not humanoidFromHit(hit) then
+				return
+			end
+			busy = true
+			task.delay(delay, function()
+				tile.Transparency = 0.85
+				tile.CanCollide = false
+				task.wait(2.5)
+				tile.Transparency = 0.15
+				tile.CanCollide = true
+				busy = false
+			end)
+		end)
+		z += 5
+	end
+	return Vector3.new(x, y, z)
+end
+
+local function truss(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local x, y = cur.X, cur.Y
+	local z = cur.Z + 3
+	platform(ctx, Vector3.new(8, 1, 6), x, y, z)
+	z += 6
+	local h = math.floor(lerp(14, 22, diff))
+	local t = Instance.new("TrussPart")
+	t.Anchored = true
+	t.Size = Vector3.new(2, h, 2)
+	t.CFrame = ctx.frame * CFrame.new(x, y + h / 2, z + 1)
+	t.Color = ctx.color
+	t.Parent = ctx.model
+	platform(ctx, Vector3.new(8, 1, 8), x, y + h, z)
+	return Vector3.new(x, y + h, z + 8)
+end
+
+local function beams(ctx: Ctx, cur: Vector3, diff: number): Vector3
+	local rng = ctx.rng
+	local x, y, z = cur.X, cur.Y, cur.Z
+	local width = lerp(2.5, 1.2, diff)
+	for _ = 1, 3 do
+		z += lerp(2, 4, diff)
+		x = math.clamp(x + rng:NextNumber(-1.5, 1.5), -8, 8)
+		local len = rng:NextInteger(10, 14)
+		platform(ctx, Vector3.new(width, 1, len), x, y, z)
+		z += len
+	end
+	return Vector3.new(x, y, z)
+end
+
+local BUILDERS: { Builder } = { jumps, killBars, spinner, vanishing, truss, beams }
+
+-- Easy steps up to guarantee each stage climbs above the one a lap below.
+local function ascend(ctx: Ctx, cur: Vector3, targetY: number): Vector3
+	local x, y, z = cur.X, cur.Y, cur.Z
+	while y < targetY do
+		z += 3
+		y = math.min(y + 3, targetY)
+		platform(ctx, Vector3.new(6, 1, 5), x, y, z)
+		z += 5
+	end
+	return Vector3.new(x, y, z)
+end
+
+local function makePad(ctx: Ctx, index: number): Part
+	local pad = makePart(ctx, Vector3.new(PAD_SIZE, 1, PAD_SIZE), CFrame.new(0, -0.5, 0), {
+		Material = Enum.Material.Neon,
+		Name = "Checkpoint" .. index,
+	})
+	pad:SetAttribute("Stage", index)
+	label(pad, "Stage " .. index, Color3.new(1, 1, 1), 90)
+	return pad
+end
+
+function Obby.build(): Course
+	local model = Instance.new("Model")
+	model.Name = "Course"
+	model.Parent = workspace
+
+	local rng = Random.new(Config.Seed)
+	local ctx: Ctx = {
+		frame = CFrame.new(0, 20, 0),
+		model = model,
+		color = Color3.new(1, 1, 1),
+		rng = rng,
+	}
+
+	local checkpoints: { BasePart } = {}
+	local lastBuilder: Builder? = nil
+
+	for i = 1, Config.StageCount do
+		local diff = (i - 1) / math.max(Config.StageCount - 1, 1)
+		ctx.color = Color3.fromHSV(((i - 1) * 0.07) % 1, 0.75, 1)
+		checkpoints[i] = makePad(ctx, i)
+
+		-- Easy, flat obstacles for the first few stages so new players hook in.
+		local builder: Builder
+		if i <= 3 then
+			builder = ({ jumps, killBars, beams } :: { Builder })[i]
+		else
+			repeat
+				builder = BUILDERS[rng:NextInteger(1, #BUILDERS)]
+			until builder ~= lastBuilder
+		end
+		lastBuilder = builder
+
+		local cur = builder(ctx, Vector3.new(0, 0, PAD_SIZE / 2), diff)
+		if i > 6 and diff > 0.3 then
+			cur = BUILDERS[rng:NextInteger(1, #BUILDERS)](ctx, cur, diff * 0.8)
+		end
+		cur = ascend(ctx, cur, MIN_STAGE_RISE)
+
+		-- Next pad: centre it ahead of the cursor, then turn the frame.
+		local nextCenter = CFrame.new(cur.X, cur.Y, cur.Z + 4 + PAD_SIZE / 2)
+		ctx.frame = ctx.frame * nextCenter * CFrame.Angles(0, math.rad(90), 0)
+	end
+
+	ctx.color = Color3.fromRGB(255, 205, 40)
+	local finish = makePart(ctx, Vector3.new(20, 1, 20), CFrame.new(0, -0.5, 0), {
+		Material = Enum.Material.Neon,
+		Name = "Finish",
+	})
+	label(finish, "FINISH!", Color3.fromRGB(255, 230, 90), 200)
+
+	-- Decorative lava sea under the tower; also a kill floor.
+	local lava = Instance.new("Part")
+	lava.Anchored = true
+	lava.Size = Vector3.new(2048, 2, 2048)
+	lava.CFrame = CFrame.new(0, -10, 0)
+	lava.Parent = model
+	makeKill(lava)
+
+	startSpinnerLoop(model)
+
+	return {
+		Checkpoints = checkpoints,
+		Finish = finish,
+	}
+end
+
+return Obby
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">Perks</string>
+          <string name="Source"><![CDATA[--!strict
+-- Game pass ownership and the perks each pass grants.
+-- Ownership is mirrored to player attributes ("Pass_VIP" etc.) for the UI.
+
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local Config = require(game:GetService("ReplicatedStorage").Shared.Config)
+
+local Perks = {}
+
+local function owns(player: Player, key: string): boolean
+	return player:GetAttribute("Pass_" .. key) == true
+end
+
+local function baseSpeed(player: Player): number
+	return owns(player, "VIP") and Config.VipWalkSpeed or Config.BaseWalkSpeed
+end
+
+local function makeCoil(name: string, color: Color3): (Tool, BasePart)
+	local tool = Instance.new("Tool")
+	tool.Name = name
+	tool.CanBeDropped = false
+	tool.ToolTip = name
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.6, 1.6, 0.6)
+	handle.Color = color
+	handle.Material = Enum.Material.Neon
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = tool
+	return tool, handle
+end
+
+local function giveSpeedCoil(player: Player)
+	local tool = makeCoil("Speed Coil", Color3.fromRGB(60, 140, 255))
+	tool.Equipped:Connect(function()
+		local hum = tool.Parent and tool.Parent:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.WalkSpeed = Config.SpeedCoilWalkSpeed
+		end
+	end)
+	tool.Unequipped:Connect(function()
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.WalkSpeed = baseSpeed(player)
+		end
+	end)
+	tool.Parent = player:WaitForChild("Backpack")
+end
+
+local function giveGravityCoil(player: Player)
+	local tool = makeCoil("Gravity Coil", Color3.fromRGB(170, 80, 255))
+	local force: VectorForce? = nil
+	tool.Equipped:Connect(function()
+		local char = tool.Parent :: Model
+		local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local att = root and root:FindFirstChild("RootAttachment") :: Attachment?
+		if not (root and att) then
+			return
+		end
+		local f = Instance.new("VectorForce")
+		f.Attachment0 = att
+		f.RelativeTo = Enum.ActuatorRelativeTo.World
+		f.ApplyAtCenterOfMass = true
+		f.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity * Config.GravityCoilLift, 0)
+		f.Parent = root
+		force = f
+	end)
+	tool.Unequipped:Connect(function()
+		if force then
+			force:Destroy()
+			force = nil
+		end
+	end)
+	tool.Parent = player:WaitForChild("Backpack")
+end
+
+local function applyVip(char: Model)
+	local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local head = char:FindFirstChild("Head") :: BasePart?
+	if root and not root:FindFirstChild("VipTrail") then
+		local a0 = Instance.new("Attachment")
+		a0.Position = Vector3.new(0, 1, 0)
+		a0.Parent = root
+		local a1 = Instance.new("Attachment")
+		a1.Position = Vector3.new(0, -1, 0)
+		a1.Parent = root
+		local trail = Instance.new("Trail")
+		trail.Name = "VipTrail"
+		trail.Attachment0 = a0
+		trail.Attachment1 = a1
+		trail.Lifetime = 0.6
+		trail.LightEmission = 1
+		trail.Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 60, 60)),
+			ColorSequenceKeypoint.new(0.33, Color3.fromRGB(255, 220, 60)),
+			ColorSequenceKeypoint.new(0.66, Color3.fromRGB(60, 220, 255)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 80, 255)),
+		})
+		trail.Parent = root
+	end
+	if head and not head:FindFirstChild("VipTag") then
+		local gui = Instance.new("BillboardGui")
+		gui.Name = "VipTag"
+		gui.Size = UDim2.fromOffset(100, 30)
+		gui.StudsOffset = Vector3.new(0, 2.5, 0)
+		gui.MaxDistance = 60
+		local t = Instance.new("TextLabel")
+		t.Size = UDim2.fromScale(1, 1)
+		t.BackgroundTransparency = 1
+		t.Font = Enum.Font.FredokaOne
+		t.TextScaled = true
+		t.Text = "VIP"
+		t.TextColor3 = Color3.fromRGB(255, 210, 50)
+		t.TextStrokeTransparency = 0
+		t.Parent = gui
+		gui.Parent = head
+	end
+end
+
+function Perks.applyToCharacter(player: Player, char: Model)
+	local hum = char:WaitForChild("Humanoid") :: Humanoid
+	hum.WalkSpeed = baseSpeed(player)
+	if owns(player, "VIP") then
+		applyVip(char)
+	end
+	if owns(player, "SpeedCoil") then
+		giveSpeedCoil(player)
+	end
+	if owns(player, "GravityCoil") then
+		giveGravityCoil(player)
+	end
+end
+
+-- Grants a pass for the current session and applies it to the live character.
+local function grant(player: Player, key: string)
+	if owns(player, key) then
+		return
+	end
+	player:SetAttribute("Pass_" .. key, true)
+	local char = player.Character
+	if not char then
+		return
+	end
+	if key == "VIP" then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.WalkSpeed = Config.VipWalkSpeed
+		end
+		applyVip(char)
+	elseif key == "SpeedCoil" then
+		giveSpeedCoil(player)
+	elseif key == "GravityCoil" then
+		giveGravityCoil(player)
+	end
+end
+
+function Perks.loadOwnership(player: Player)
+	for _, key in Config.GamePassOrder do
+		local id = Config.GamePasses[key].Id
+		if id ~= 0 then
+			local ok, result = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, player.UserId, id)
+			if ok and result then
+				player:SetAttribute("Pass_" .. key, true)
+			end
+		end
+	end
+end
+
+function Perks.grantPassById(player: Player, passId: number): string?
+	for _, key in Config.GamePassOrder do
+		if Config.GamePasses[key].Id == passId and passId ~= 0 then
+			grant(player, key)
+			return key
+		end
+	end
+	return nil
+end
+
+return Perks
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="10">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="11">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="12">
+        <Properties>
+          <string name="Name">Client</string>
+        </Properties>
+        <Item class="LocalScript" referent="13">
+          <Properties>
+            <string name="Name">Hud</string>
+            <string name="Source"><![CDATA[--!strict
+-- HUD: stage counter, Skip Stage button, shop for passes/products,
+-- toasts, the "stuck? skip it" nudge and the play-again button.
+
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local Config = require(ReplicatedStorage.Shared.Config)
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local Notify = remotes:WaitForChild("Notify") :: RemoteEvent
+local SkipNudge = remotes:WaitForChild("SkipNudge") :: RemoteEvent
+local Restart = remotes:WaitForChild("Restart") :: RemoteEvent
+
+local player = Players.LocalPlayer
+
+local FONT = Enum.Font.FredokaOne
+local GREEN = Color3.fromRGB(40, 200, 90)
+local PURPLE = Color3.fromRGB(120, 70, 230)
+local DARK = Color3.fromRGB(20, 18, 32)
+
+local function new<T>(className: string, props: { [string]: any }, children: { Instance }?): T
+	local inst = Instance.new(className)
+	for k, v in props do
+		if k ~= "Parent" then
+			(inst :: any)[k] = v
+		end
+	end
+	for _, c in children or {} do
+		c.Parent = inst
+	end
+	if props.Parent then
+		inst.Parent = props.Parent
+	end
+	return (inst :: any) :: T
+end
+
+local function corner(r: number): UICorner
+	return new("UICorner", { CornerRadius = UDim.new(0, r) })
+end
+
+local function stroke(): UIStroke
+	return new("UIStroke", { Thickness = 2, Color = Color3.new(0, 0, 0), Transparency = 0.4 })
+end
+
+local function button(text: string, color: Color3, props: { [string]: any }): TextButton
+	local b = new("TextButton", {
+		Text = text,
+		Font = FONT,
+		TextScaled = true,
+		TextColor3 = Color3.new(1, 1, 1),
+		BackgroundColor3 = color,
+		AutoButtonColor = true,
+	}, { corner(10), stroke(), new("UIPadding", {
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 8),
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 4),
+	}) })
+	for k, v in props do
+		(b :: any)[k] = v
+	end
+	return b
+end
+
+-- Prices are looked up once and cached.
+local priceCache: { [string]: number? } = {}
+local function price(id: number, infoType: Enum.InfoType): number?
+	local cacheKey = `{infoType.Name}:{id}`
+	if priceCache[cacheKey] == nil then
+		local ok, info = pcall(MarketplaceService.GetProductInfo, MarketplaceService, id, infoType)
+		priceCache[cacheKey] = ok and info and info.PriceInRobux or nil
+	end
+	return priceCache[cacheKey]
+end
+
+local function robux(n: number?): string
+	return n and `R${n}` or ""
+end
+
+local function buyProduct(key: string)
+	local id = Config.Products[key].Id
+	if id ~= 0 then
+		MarketplaceService:PromptProductPurchase(player, id)
+	end
+end
+
+local gui = new("ScreenGui", {
+	Name = "Hud",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = player:WaitForChild("PlayerGui"),
+}) :: ScreenGui
+
+-- Stage counter
+local stageLabel = new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 8),
+	Size = UDim2.fromOffset(240, 44),
+	BackgroundColor3 = DARK,
+	BackgroundTransparency = 0.25,
+	Font = FONT,
+	TextScaled = true,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "Stage 1",
+	Parent = gui,
+}, { corner(12), new("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4) }) }) :: TextLabel
+
+-- Skip Stage: the main conversion button, always on screen.
+local skipId = Config.Products.SkipStage.Id
+local skipButton = button("SKIP STAGE", GREEN, {
+	AnchorPoint = Vector2.new(1, 1),
+	Position = UDim2.new(1, -12, 1, -110),
+	Size = UDim2.fromOffset(170, 56),
+	Visible = false,
+	Parent = gui,
+})
+skipButton.Activated:Connect(function()
+	buyProduct("SkipStage")
+end)
+
+local function refreshStage()
+	local stage = (player:GetAttribute("Stage") :: number?) or 1
+	stageLabel.Text = `Stage {stage} / {Config.StageCount}`
+	skipButton.Visible = skipId ~= 0 and stage < Config.StageCount
+end
+player:GetAttributeChangedSignal("Stage"):Connect(refreshStage)
+refreshStage()
+
+task.spawn(function()
+	if skipId ~= 0 then
+		local p = price(skipId, Enum.InfoType.Product)
+		if p then
+			skipButton.Text = `SKIP STAGE {robux(p)}`
+		end
+	end
+end)
+
+-- Toasts
+local toastHolder = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 60),
+	Size = UDim2.new(0.6, 0, 0, 200),
+	BackgroundTransparency = 1,
+	Parent = gui,
+}, { new("UIListLayout", {
+	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+	Padding = UDim.new(0, 6),
+}) })
+
+local TOAST_COLORS = {
+	stage = Color3.fromRGB(60, 160, 255),
+	win = Color3.fromRGB(255, 190, 30),
+	purchase = GREEN,
+}
+
+local function toast(text: string, kind: string)
+	local t = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, kind == "win" and 56 or 36),
+		BackgroundColor3 = TOAST_COLORS[kind] or DARK,
+		Font = FONT,
+		TextScaled = true,
+		TextColor3 = Color3.new(1, 1, 1),
+		Text = text,
+		Parent = toastHolder,
+	}, { corner(10), stroke() }) :: TextLabel
+	task.delay(kind == "win" and 6 or 2.5, function()
+		local tween = TweenService:Create(t, TweenInfo.new(0.4), { BackgroundTransparency = 1, TextTransparency = 1 })
+		tween:Play()
+		tween.Completed:Wait()
+		t:Destroy()
+	end)
+end
+Notify.OnClientEvent:Connect(toast)
+
+-- Shop
+local shopFrame = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromScale(0.5, 0.65),
+	BackgroundColor3 = DARK,
+	Visible = false,
+	Parent = gui,
+}, {
+	corner(16),
+	new("UISizeConstraint", { MinSize = Vector2.new(300, 300), MaxSize = Vector2.new(520, 560) }),
+}) :: Frame
+
+new("TextLabel", {
+	Size = UDim2.new(1, -60, 0, 44),
+	Position = UDim2.fromOffset(12, 8),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextScaled = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "SHOP",
+	Parent = shopFrame,
+})
+
+local closeButton = button("X", Color3.fromRGB(220, 60, 70), {
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 10),
+	Size = UDim2.fromOffset(40, 40),
+	Parent = shopFrame,
+})
+closeButton.Activated:Connect(function()
+	shopFrame.Visible = false
+end)
+
+local list = new("ScrollingFrame", {
+	Position = UDim2.fromOffset(10, 60),
+	Size = UDim2.new(1, -20, 1, -70),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = shopFrame,
+}, { new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }) }) :: ScrollingFrame
+
+local function shopRow(order: number, title: string, desc: string, color: Color3, onBuy: () -> (), ownedAttr: string?)
+	local row = new("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, -8, 0, 76),
+		BackgroundColor3 = Color3.fromRGB(38, 34, 58),
+		Parent = list,
+	}, { corner(12) }) :: Frame
+	new("TextLabel", {
+		Position = UDim2.fromOffset(12, 6),
+		Size = UDim2.new(0.65, -12, 0, 30),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = color,
+		Text = title,
+		Parent = row,
+	})
+	new("TextLabel", {
+		Position = UDim2.fromOffset(12, 38),
+		Size = UDim2.new(0.65, -12, 0, 32),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextScaled = true,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Color3.fromRGB(200, 200, 220),
+		Text = desc,
+		Parent = row,
+	})
+	local buy = button("BUY", GREEN, {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.new(0.33, -10, 0, 48),
+		Parent = row,
+	})
+	buy.Activated:Connect(function()
+		if not (ownedAttr and player:GetAttribute(ownedAttr)) then
+			onBuy()
+		end
+	end)
+	return buy
+end
+
+local order = 0
+for _, key in Config.GamePassOrder do
+	local pass = Config.GamePasses[key]
+	if pass.Id ~= 0 then
+		order += 1
+		local attr = "Pass_" .. key
+		local buy = shopRow(order, pass.Name, pass.Description, Color3.fromRGB(255, 210, 60), function()
+			MarketplaceService:PromptGamePassPurchase(player, pass.Id)
+		end, attr)
+		local function refresh()
+			if player:GetAttribute(attr) then
+				buy.Text = "OWNED"
+				buy.BackgroundColor3 = Color3.fromRGB(90, 90, 110)
+			end
+		end
+		player:GetAttributeChangedSignal(attr):Connect(refresh)
+		refresh()
+		task.spawn(function()
+			local p = price(pass.Id, Enum.InfoType.GamePass)
+			if p and not player:GetAttribute(attr) then
+				buy.Text = robux(p)
+			end
+		end)
+	end
+end
+for _, key in Config.ProductOrder do
+	local product = Config.Products[key]
+	if product.Id ~= 0 then
+		order += 1
+		local buy = shopRow(order, product.Name, `Jump ahead {product.Stages} stage(s) instantly.`, Color3.fromRGB(120, 230, 150), function()
+			buyProduct(key)
+		end)
+		task.spawn(function()
+			local p = price(product.Id, Enum.InfoType.Product)
+			if p then
+				buy.Text = robux(p)
+			end
+		end)
+	end
+end
+
+local shopButton = button("SHOP", PURPLE, {
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 12, 0.5, 0),
+	Size = UDim2.fromOffset(110, 50),
+	Visible = order > 0,
+	Parent = gui,
+})
+shopButton.Activated:Connect(function()
+	shopFrame.Visible = not shopFrame.Visible
+end)
+
+-- "Stuck?" nudge after repeated deaths on one stage
+local nudge = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -20),
+	Size = UDim2.fromOffset(340, 120),
+	BackgroundColor3 = DARK,
+	Visible = false,
+	Parent = gui,
+}, { corner(14), stroke() }) :: Frame
+local nudgeText = new("TextLabel", {
+	Position = UDim2.fromOffset(10, 8),
+	Size = UDim2.new(1, -20, 0, 44),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	TextScaled = true,
+	TextColor3 = Color3.new(1, 1, 1),
+	Text = "Stuck?",
+	Parent = nudge,
+}) :: TextLabel
+local nudgeSkip = button("SKIP IT", GREEN, {
+	Position = UDim2.new(0, 10, 1, -58),
+	Size = UDim2.new(0.5, -15, 0, 48),
+	Parent = nudge,
+})
+local nudgeNo = button("Keep trying", Color3.fromRGB(80, 80, 100), {
+	Position = UDim2.new(0.5, 5, 1, -58),
+	Size = UDim2.new(0.5, -15, 0, 48),
+	Parent = nudge,
+})
+nudgeSkip.Activated:Connect(function()
+	nudge.Visible = false
+	buyProduct("SkipStage")
+end)
+nudgeNo.Activated:Connect(function()
+	nudge.Visible = false
+end)
+SkipNudge.OnClientEvent:Connect(function(stage: number)
+	if skipId == 0 then
+		return
+	end
+	local p = price(skipId, Enum.InfoType.Product)
+	nudgeText.Text = if p then `Stuck on Stage {stage}? Skip it for {robux(p)}!` else `Stuck on Stage {stage}? Skip it!`
+	nudge.Visible = true
+	task.delay(8, function()
+		nudge.Visible = false
+	end)
+end)
+
+-- Play again after finishing
+local again = button("PLAY AGAIN", Color3.fromRGB(255, 170, 30), {
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -30),
+	Size = UDim2.fromOffset(220, 60),
+	Visible = false,
+	Parent = gui,
+})
+again.Activated:Connect(function()
+	Restart:FireServer()
+end)
+player:GetAttributeChangedSignal("Completed"):Connect(function()
+	again.Visible = player:GetAttribute("Completed") == true
+end)
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="14">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <float name="Gravity">196.2</float>
+      <bool name="NeedsPivotMigration">false</bool>
+      <bool name="StreamingEnabled">false</bool>
+    </Properties>
+  </Item>
+</roblox>
